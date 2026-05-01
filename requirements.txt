@@ -1,0 +1,6 @@
+opencv-python
+dlib
+scikit-image
+numpy
+urllib3
+face_recognition_models
