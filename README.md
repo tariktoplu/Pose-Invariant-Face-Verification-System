@@ -1,7 +1,6 @@
 # Project Report: Classical Face Verification under Extreme Occlusion
 
-**To:** Senior Developer  
-**From:** Intern  
+
 **Date:** May 2026  
 **Subject:** Final Delivery - Pose-Invariant Face Verification System (Classical CV)
 
