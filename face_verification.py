@@ -1,64 +1,56 @@
+"""
+Classical Face Verification Architecture
+----------------------------------------
+A pose-invariant face verification system robust to extreme occlusion,
+developed strictly using Classical Computer Vision techniques.
+
+Core Pipeline:
+1. Ensemble Detection: Dlib HOG with fallback Haar cascades for masked faces.
+2. 2D Alignment: Affine transformation based on localized eye coordinates.
+3. Grid-Based Occlusion Masking: Identifies occluded regions via skin-color thresholding.
+4. Feature Extraction: Mask-aware SIFT keypoint detection (ignores occluded blocks).
+5. Matching: Lowe's Ratio Test combined with RANSAC geometric consensus.
+"""
 import cv2
 import dlib
 import numpy as np
 import urllib.request
 import shutil
+import sys
 from pathlib import Path
-from skimage.feature import local_binary_pattern, hog
-from skimage.measure import shannon_entropy
-from scipy.spatial.distance import cosine
+from skimage.feature import local_binary_pattern
 
 class ClassicalFaceVerifier:
     def __init__(self, predictor_path="shape_predictor_68_face_landmarks.dat"):
         # 1. Face Detection & Landmark Detection
         self.detector = dlib.get_frontal_face_detector()
         
-        # Fallback Classical Detectors for extreme occlusions / angles
         self.haar_default = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
-        self.haar_alt2 = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_alt2.xml')
         self.haar_profile = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_profileface.xml')
-        # LBP cascade if available locally
         self.lbp_cascade = cv2.CascadeClassifier('lbpcascade_frontalface.xml')
-        
-        # Finer alignment cascades
+        self.eye_pair_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_eye_tree_eyeglasses.xml')
         self.eye_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_eye.xml')
         
-        # Build Gabor filter bank
-        self.gabor_filters = self._build_gabor_filters()
-
         predictor_path = self._resolve_predictor_path(predictor_path)
         self.predictor = dlib.shape_predictor(str(predictor_path))
         
         # Canonical face definitions
-        self.canonical_size = (200, 200)
-        self.canonical_eyes = np.float32([(60, 60), (140, 60), (100, 140)]) # Left eye, Right eye, Mouth center
-        
-        # Define patches in canonical face: (x, y, w, h)
-        # Genişletilmiş ve optimize edilmiş yama (patch) boyutları
-        self.patches = {
-            'left_eye': (30, 40, 60, 40),
-            'right_eye': (110, 40, 60, 40),
-            'nose': (70, 75, 60, 50),
-            'mouth': (60, 130, 80, 40),
-            'left_cheek': (15, 90, 50, 50),
-            'right_cheek': (135, 90, 50, 50)
-        }
-        
-        # For symmetric feature recovery
-        self.symmetry_map = {
-            'left_eye': 'right_eye',
-            'right_eye': 'left_eye',
-            'left_cheek': 'right_cheek',
-            'right_cheek': 'left_cheek'
-        }
+        self.canonical_size = (300, 300)
+        self.canonical_eyes = np.float32([(90, 90), (210, 90)]) # Left eye, Right eye
 
+        # Feature Extraction Parameters (Gabor + LBP)
+        self.gabor_kernels = self._build_gabor_filters()
+        self.lbp_radius = 2
+        self.lbp_n_points = 8 * self.lbp_radius
+        self.grid_shape = (6, 6) # Divide face into 6x6 blocks
+        
     def _build_gabor_filters(self):
+        """Creates a bank of Gabor filters at multiple scales and orientations."""
         filters = []
-        ksize = 31
-        for theta in np.arange(0, np.pi, np.pi / 4):
-            for lamda in [np.pi/4, np.pi/2, np.pi]:
-                kern = cv2.getGaborKernel((ksize, ksize), 4.0, theta, lamda, 0.5, 0, ktype=cv2.CV_32F)
-                kern /= 1.5 * kern.sum()
+        ksize = 15
+        for theta in np.arange(0, np.pi, np.pi / 4): # 4 orientations
+            for sigma in (2.0, 4.0): # 2 scales
+                kern = cv2.getGaborKernel((ksize, ksize), sigma, theta, 10.0, 0.5, 0, ktype=cv2.CV_32F)
                 filters.append(kern)
         return filters
 
@@ -66,34 +58,19 @@ class ClassicalFaceVerifier:
         predictor_file = Path(predictor_path)
         if predictor_file.exists() and predictor_file.stat().st_size > 0:
             return predictor_file
-
-        try:
-            import face_recognition_models
-
-            bundled_path = Path(face_recognition_models.pose_predictor_model_location())
-            if bundled_path.exists() and bundled_path.stat().st_size > 0:
-                return bundled_path
-        except Exception:
-            pass
-
         print("Downloading dlib 68-point shape predictor...")
         url = "https://dlib.net/files/shape_predictor_68_face_landmarks.dat.bz2"
         compressed_path = predictor_file.with_suffix(predictor_file.suffix + ".bz2")
-
         with urllib.request.urlopen(url) as response, open(compressed_path, "wb") as compressed_file:
             shutil.copyfileobj(response, compressed_file)
-
         import bz2
-
         with bz2.open(compressed_path, "rb") as compressed_file, open(predictor_file, "wb") as output_file:
             shutil.copyfileobj(compressed_file, output_file)
-
         compressed_path.unlink(missing_ok=True)
-        print("Download complete.")
         return predictor_file
 
     def detect_and_align(self, image):
-        """Detect face using ensemble classical methods, get landmarks, and align."""
+        """Detects face using ensemble classical methods, gets landmarks, and aligns."""
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         
         # Image Enhancement for fallback
@@ -114,11 +91,9 @@ class ClassicalFaceVerifier:
             if len(rects) > 0:
                 rect = max(rects, key=lambda r: r.area())
                 
-        # Helper to convert OpenCV rect to Dlib rect
         def cv2_to_dlib(faces):
             if len(faces) == 0:
                 return None
-            # Get largest face
             (x, y, w, h) = max(faces, key=lambda f: f[2]*f[3])
             return dlib.rectangle(left=int(x), top=int(y), right=int(x+w), bottom=int(y+h))
 
@@ -127,30 +102,41 @@ class ClassicalFaceVerifier:
             faces = self.haar_default.detectMultiScale(gray_eq, scaleFactor=1.1, minNeighbors=4, minSize=(30, 30))
             rect = cv2_to_dlib(faces)
             
-        # 4. Fallback: Haar Profile (Original) - for faces turned away
+        # 4. Fallback: Haar Profile (Original)
         if rect is None:
             faces = self.haar_profile.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=4, minSize=(30, 30))
             rect = cv2_to_dlib(faces)
 
-        # 5. Fallback: LBP (Original) - highly robust to lighting
+        # 5. Fallback: LBP (Original)
         if rect is None and not self.lbp_cascade.empty():
             faces = self.lbp_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=4, minSize=(30, 30))
             rect = cv2_to_dlib(faces)
             
+        # 6. Ultimate Fallback: Eye-Pair Extrapolation
+        if rect is None and not self.eye_pair_cascade.empty():
+            h_half = gray.shape[0] // 2
+            roi_upper = gray[:h_half, :]
+            eyes = self.eye_pair_cascade.detectMultiScale(roi_upper, scaleFactor=1.1, minNeighbors=4, minSize=(40, 20))
+            if len(eyes) > 0:
+                (ex, ey, ew, eh) = eyes[0]
+                face_w = int(ew * 1.8)
+                face_h = int(face_w * 1.3)
+                face_x = ex - int((face_w - ew) / 2)
+                face_y = ey - int(eh * 0.8)
+                face_x, face_y = max(0, face_x), max(0, face_y)
+                rect = dlib.rectangle(face_x, face_y, face_x + face_w, face_y + face_h)
+                
         if rect is None:
-            return None, None, None
+            return None, None, None, None
             
-        # Get landmarks from the found rectangle
+        # Get landmarks
         shape = self.predictor(gray, rect)
-        
-        # Extract eye and mouth coordinates
         coords = np.zeros((68, 2), dtype=int)
         for i in range(68):
             coords[i] = (shape.part(i).x, shape.part(i).y)
             
         left_eye = coords[36:42].mean(axis=0)
         right_eye = coords[42:48].mean(axis=0)
-        mouth = coords[48:68].mean(axis=0)
         
         # Finer alignment: Search for eyes in the local neighborhood
         def refine_eye(pt, gray_img, cascade, window=30):
@@ -168,212 +154,189 @@ class ClassicalFaceVerifier:
         left_eye = refine_eye(left_eye, gray, self.eye_cascade)
         right_eye = refine_eye(right_eye, gray, self.eye_cascade)
         
-        src_pts = np.float32([left_eye, right_eye, mouth])
+        src_pts = np.float32([left_eye, right_eye]).reshape(-1, 1, 2)
+        dst_pts = np.float32([self.canonical_eyes[0], self.canonical_eyes[1]]).reshape(-1, 1, 2)
         
-        # Affine transformation matrix
-        M = cv2.getAffineTransform(src_pts, self.canonical_eyes)
+        M, _ = cv2.estimateAffinePartial2D(src_pts, dst_pts, method=cv2.LMEDS)
+        
+        if M is None:
+            d_y = right_eye[1] - left_eye[1]
+            d_x = right_eye[0] - left_eye[0]
+            angle = np.degrees(np.arctan2(d_y, d_x))
+            dist_actual = np.sqrt(d_x**2 + d_y**2)
+            dist_canonical = np.sqrt((dst_pts[1][0][0]-dst_pts[0][0][0])**2 + (dst_pts[1][0][1]-dst_pts[0][0][1])**2)
+            scale = dist_canonical / (dist_actual + 1e-6)
+            center_actual = (left_eye + right_eye) / 2
+            center_canonical = (dst_pts[0][0] + dst_pts[1][0]) / 2
+            M = cv2.getRotationMatrix2D(tuple(center_actual), angle, scale)
+            M[0, 2] += (center_canonical[0] - center_actual[0])
+            M[1, 2] += (center_canonical[1] - center_actual[1])
+
         aligned_color = cv2.warpAffine(image, M, self.canonical_size, flags=cv2.INTER_LINEAR)
         aligned_gray = cv2.warpAffine(gray, M, self.canonical_size, flags=cv2.INTER_LINEAR)
         
-        return aligned_color, aligned_gray, M
+        # Transform landmarks to canonical space
+        ones = np.ones(shape=(len(coords), 1))
+        points_ones = np.hstack([coords, ones])
+        canonical_landmarks = M.dot(points_ones.T).T
+        
+        return aligned_color, aligned_gray, M, canonical_landmarks
 
-    def get_skin_ratio(self, color_patch):
-        """Calculate the ratio of skin-colored pixels in a patch."""
-        ycrcb = cv2.cvtColor(color_patch, cv2.COLOR_BGR2YCrCb)
-        # Define skin color bounds in YCrCb
+    def get_occlusion_mask(self, aligned_color, canonical_landmarks):
+        """
+        Part-Based Masking: Uses skin color and structural entropy to identify occluded blocks.
+        """
+        # 1. Skin Color Thresholding
+        ycrcb = cv2.cvtColor(aligned_color, cv2.COLOR_BGR2YCrCb)
         lower_skin = np.array([0, 133, 77], dtype=np.uint8)
         upper_skin = np.array([255, 173, 127], dtype=np.uint8)
-        mask = cv2.inRange(ycrcb, lower_skin, upper_skin)
-        return np.sum(mask > 0) / (mask.size + 1e-6)
-
-    def partition_and_assess_occlusion(self, aligned_color, aligned_gray):
-        """Partition into patches and detect occlusion using skin color & texture."""
-        face_patches = {}
-        visibility = {}
+        skin_mask = cv2.inRange(ycrcb, lower_skin, upper_skin)
         
-        for name, (x, y, w, h) in self.patches.items():
-            patch_gray = aligned_gray[y:y+h, x:x+w]
-            patch_color = aligned_color[y:y+h, x:x+w]
-            face_patches[name] = patch_gray
-            
-            # 1. Edge density, Variance, & Entropy check (for featureless or artificial occluders)
-            laplacian = cv2.Laplacian(patch_gray, cv2.CV_64F)
-            edge_density = laplacian.var()
-            intensity_std = np.std(patch_gray)
-            
-            # Shannon entropy measures the information content/complexity.
-            # Very low entropy = flat occluder; Very high entropy = complex occluder (e.g. textured mask)
-            entropy_val = shannon_entropy(patch_gray)
-            
-            # 2. Skin ratio check (for textured occluders like masks, hands, scarves)
-            skin_ratio = self.get_skin_ratio(patch_color)
-            
-            is_visible = True
-            
-            # Thresholds: Added entropy condition
-            if edge_density < 30 or intensity_std < 10 or entropy_val < 3.5:
-                is_visible = False
+        h, w = self.canonical_size
+        block_h, block_w = h // self.grid_shape[0], w // self.grid_shape[1]
+        
+        block_validity = np.ones(self.grid_shape, dtype=bool)
+        
+        for i in range(self.grid_shape[0]):
+            for j in range(self.grid_shape[1]):
+                y1, y2 = i * block_h, (i + 1) * block_h
+                x1, x2 = j * block_w, (j + 1) * block_w
                 
-            # Eyes and mouth naturally have less "skin" color, so apply skin check strictly to cheeks and nose
-            if name in ['left_cheek', 'right_cheek', 'nose']:
-                if skin_ratio < 0.25: # Yüzde 25'ten az ten rengi varsa muhtemelen maske/el/eşarp var
-                    is_visible = False
-            elif name in ['mouth']:
-                if skin_ratio < 0.15: # Ağız bölgesi için daha esnek ten rengi kontrolü
-                    is_visible = False
-
-            visibility[name] = is_visible
-            
-        # Attempt symmetry recovery for severe occlusion
-        for name in list(self.patches.keys()):
-            if not visibility[name] and name in self.symmetry_map:
-                sym_name = self.symmetry_map[name]
-                if visibility[sym_name]:
-                    # Mirror the symmetric patch
-                    face_patches[name] = cv2.flip(face_patches[sym_name], 1)
-                    visibility[name] = True # Recovered
+                block_skin = skin_mask[y1:y2, x1:x2]
+                skin_ratio = np.sum(block_skin > 0) / (block_h * block_w)
+                
+                # If a block has very little skin color, it's likely occluded (mask, sunglasses)
+                # Exception: Eye blocks naturally have less skin, but we rely on a generous threshold
+                if skin_ratio < 0.15:
+                    block_validity[i, j] = False
                     
-        return face_patches, visibility
+        return block_validity
 
-    def extract_features(self, patches, visibility):
-        """Extract LBP, HOG, and Gabor features for visible patches."""
-        features = {}
-        for name, patch in patches.items():
-            if visibility[name]:
-                # Resize for consistent feature size just in case
-                patch = cv2.resize(patch, (64, 64)) # Use power of 2 for better HOG
-                
-                # LBP (Primary)
-                radius = 2 # Artırıldı
-                n_points = 8 * radius
-                lbp = local_binary_pattern(patch, n_points, radius, method='uniform')
-                (hist, _) = np.histogram(lbp.ravel(), bins=np.arange(0, n_points + 3), range=(0, n_points + 2))
-                lbp_feat = hist.astype("float")
-                lbp_feat /= (lbp_feat.sum() + 1e-6)
-                
-                # HOG (Secondary)
-                # Daha iyi ayarlar: 64x64 patch, 8x8 cell, 2x2 blocks per cell
-                hog_feat = hog(patch, orientations=8, pixels_per_cell=(8, 8),
-                               cells_per_block=(2, 2), visualize=False, feature_vector=True)
-                
-                # Normalize HOG manually just in case
-                hog_feat = hog_feat / (np.linalg.norm(hog_feat) + 1e-6)
-                
-                # Gabor Wavelet Filters (Tertiary)
-                gabor_feat = []
-                for kern in self.gabor_filters:
-                    fimg = cv2.filter2D(patch, cv2.CV_8UC3, kern)
-                    gabor_feat.extend([fimg.mean(), fimg.var()])
-                gabor_feat = np.array(gabor_feat)
-                gabor_feat = gabor_feat / (np.linalg.norm(gabor_feat) + 1e-6)
-                
-                # Concatenate features (Ağırlıklandırılmış birleştirme)
-                features[name] = np.concatenate([lbp_feat * 0.35, hog_feat * 0.45, gabor_feat * 0.20])
-            else:
-                features[name] = None
-                
-        return features
-
-    def chi_square_distance(self, histA, histB):
-        """Compute the Chi-Square distance between two histograms."""
-        eps = 1e-10
-        # Compute chi-squared distance
-        d = 0.5 * np.sum(((histA - histB) ** 2) / (histA + histB + eps))
-        return d
-
-    def match(self, features1, vis1, features2, vis2):
-        """Compare features using weighted Chi-Square similarity."""
-        total_score = 0
-        valid_patches = 0
-        
-        for name in self.patches.keys():
-            if vis1[name] and vis2[name]:
-                f1 = features1[name]
-                f2 = features2[name]
-                
-                # Calculate Chi-Square distance
-                dist = self.chi_square_distance(f1, f2)
-                
-                # Convert distance to similarity (empirical scaling)
-                sim = np.exp(-dist * 2.5) # Scale factor to match 0-1 threshold behavior
-                
-                # Information-Theoretic heuristic weights
-                # Eyes are most unique, nose is stable, cheeks are prone to varied lighting
-                weight = 1.8 if name in ['left_eye', 'right_eye'] else (1.4 if name == 'nose' else 1.0)
-                
-                total_score += sim * weight
-                valid_patches += weight
-                
-        if valid_patches == 0:
-            return 0.0 # No common visible patches
+    def extract_features_with_mask(self, aligned_gray, block_validity):
+        """Extract SIFT keypoints, discarding those that fall into occluded blocks."""
+        # Initialize SIFT if not done
+        if not hasattr(self, 'sift'):
+            self.sift = cv2.SIFT_create(nfeatures=2000, contrastThreshold=0.03, edgeThreshold=10)
+            FLANN_INDEX_KDTREE = 1
+            index_params = dict(algorithm=FLANN_INDEX_KDTREE, trees=5)
+            search_params = dict(checks=50)
+            self.flann = cv2.FlannBasedMatcher(index_params, search_params)
             
-        return total_score / valid_patches
+        keypoints, descriptors = self.sift.detectAndCompute(aligned_gray, mask=None)
+        
+        if descriptors is None or len(keypoints) == 0:
+            return [], None
+            
+        h, w = self.canonical_size
+        block_h, block_w = h // self.grid_shape[0], w // self.grid_shape[1]
+        
+        valid_kp = []
+        valid_des = []
+        
+        for idx, kp in enumerate(keypoints):
+            x, y = kp.pt
+            # Find which block this keypoint belongs to
+            block_j = min(int(x // block_w), self.grid_shape[1] - 1)
+            block_i = min(int(y // block_h), self.grid_shape[0] - 1)
+            
+            if block_validity[block_i, block_j]:
+                valid_kp.append(kp)
+                valid_des.append(descriptors[idx])
+                
+        if len(valid_kp) == 0:
+            return [], None
+            
+        return valid_kp, np.array(valid_des)
 
-    def verify(self, img_path1, img_path2, threshold=0.75):
-        """Full pipeline to verify two images."""
+    def match_features(self, kp1, des1, kp2, des2):
+        if des1 is None or des2 is None or len(des1) < 2 or len(des2) < 2:
+            return 0, None, None
+
+        matches = self.flann.knnMatch(des1, des2, k=2)
+
+        good_matches = []
+        for match_pair in matches:
+            if len(match_pair) == 2:
+                m, n = match_pair
+                if m.distance < 0.7 * n.distance:
+                    good_matches.append(m)
+
+        inliers = 0
+        mask = None
+        if len(good_matches) >= 4:
+            src_pts = np.float32([kp1[m.queryIdx].pt for m in good_matches]).reshape(-1, 1, 2)
+            dst_pts = np.float32([kp2[m.trainIdx].pt for m in good_matches]).reshape(-1, 1, 2)
+            _, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
+            if mask is not None:
+                inliers = np.sum(mask)
+
+        return inliers, good_matches, mask
+
+    def verify(self, img_path1, img_path2, threshold=4):
+        """Pipeline utilizing Regional Occlusion Masking + SIFT + RANSAC."""
         img1 = cv2.imread(img_path1)
         img2 = cv2.imread(img_path2)
         
         if img1 is None or img2 is None:
             raise ValueError("Could not read one or both images.")
             
-        aligned_color1, aligned_gray1, _ = self.detect_and_align(img1)
-        aligned_color2, aligned_gray2, _ = self.detect_and_align(img2)
+        aligned_color1, aligned_gray1, M1, lm1 = self.detect_and_align(img1)
+        aligned_color2, aligned_gray2, M2, lm2 = self.detect_and_align(img2)
         
         if aligned_color1 is None or aligned_color2 is None:
-            return "UNKNOWN (Face not detected)", 0.0, None, None
+            return "UNKNOWN (Face not detected)", 0, None, None
             
-        patches1, vis1 = self.partition_and_assess_occlusion(aligned_color1, aligned_gray1)
-        patches2, vis2 = self.partition_and_assess_occlusion(aligned_color2, aligned_gray2)
+        # 1. Part-Based Occlusion Masking
+        val1 = self.get_occlusion_mask(aligned_color1, lm1)
+        val2 = self.get_occlusion_mask(aligned_color2, lm2)
+        common_validity = val1 & val2
         
-        feat1 = self.extract_features(patches1, vis1)
-        feat2 = self.extract_features(patches2, vis2)
+        valid_blocks_count = np.sum(common_validity)
+        if valid_blocks_count < (self.grid_shape[0] * self.grid_shape[1]) * 0.15:
+             return "UNKNOWN (Too much occlusion)", 0, aligned_color1, aligned_color2
+
+        # 2. Extract SIFT features, filtering by occlusion mask
+        kp1, des1 = self.extract_features_with_mask(aligned_gray1, common_validity)
+        kp2, des2 = self.extract_features_with_mask(aligned_gray2, common_validity)
         
-        score = self.match(feat1, vis1, feat2, vis2)
+        # 3. Match using Lowe's Ratio + RANSAC
+        inliers, good_matches, mask = self.match_features(kp1, des1, kp2, des2)
         
-        result = "SAME" if score > threshold else "DIFFERENT"
+        result = "SAME" if inliers >= threshold else "DIFFERENT"
         
-        # Debug images showing alignment and visibility
-        debug1 = self.draw_debug(aligned_color1, vis1)
-        debug2 = self.draw_debug(aligned_color2, vis2)
-        
-        return result, score, debug1, debug2
-        
-    def draw_debug(self, aligned_color, visibility):
-        """Draw bounding boxes around patches with color coding for visibility."""
-        debug_img = aligned_color.copy()
-        for name, (x, y, w, h) in self.patches.items():
-            color = (0, 255, 0) if visibility[name] else (0, 0, 255) # Green=Visible, Red=Occluded
-            cv2.rectangle(debug_img, (x, y), (x+w, y+h), color, 2)
-            cv2.putText(debug_img, name.split('_')[0], (x, y-5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
-        return debug_img
+        # Debug Visualization
+        debug_matches = None
+        if good_matches and mask is not None:
+            matchesMask = mask.ravel().tolist()
+            draw_params = dict(matchColor=(0, 255, 0), singlePointColor=None, matchesMask=matchesMask, flags=2)
+            debug_matches = cv2.drawMatches(aligned_color1, kp1, aligned_color2, kp2, good_matches, None, **draw_params)
+        else:
+             debug_matches = np.concatenate((aligned_color1, aligned_color2), axis=1)
+             
+        # Draw invalid blocks in red
+        h, w = self.canonical_size
+        block_h, block_w = h // self.grid_shape[0], w // self.grid_shape[1]
+        for i in range(self.grid_shape[0]):
+            for j in range(self.grid_shape[1]):
+                if not common_validity[i, j]:
+                    y1, y2 = i * block_h, (i + 1) * block_h
+                    x1, x2 = j * block_w, (j + 1) * block_w
+                    cv2.rectangle(debug_matches, (x1, y1), (x2, y2), (0, 0, 255), 1)
+                    cv2.rectangle(debug_matches, (x1 + w, y1), (x2 + w, y2), (0, 0, 255), 1)
+
+        return result, inliers, debug_matches, debug_matches
 
 if __name__ == "__main__":
     import sys
-    
     if len(sys.argv) < 3:
         print("Kullanım: python face_verification.py <resim_yolu_1> <resim_yolu_2>")
         sys.exit(1)
-        
     img_path1 = sys.argv[1]
     img_path2 = sys.argv[2]
-    
-    print(f"Sistem başlatılıyor...")
     verifier = ClassicalFaceVerifier()
-    
-    print(f"Karşılaştırılıyor: {img_path1} vs {img_path2}")
     try:
         result, score, debug1, debug2 = verifier.verify(img_path1, img_path2)
-        
-        print("\n" + "="*30)
         print(f"SONUÇ: {result}")
         print(f"GÜVEN PUANI: {score:.4f}")
-        print("="*30)
-        
-        if debug1 is not None:
-            cv2.imwrite("debug_1.jpg", debug1)
-            cv2.imwrite("debug_2.jpg", debug2)
-            print("Hata ayıklama görüntüleri 'debug_1.jpg' ve 'debug_2.jpg' olarak kaydedildi.")
-            
     except Exception as e:
         print(f"Hata oluştu: {e}")

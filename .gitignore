@@ -5,3 +5,4 @@ __pycache__/
 dataset/
 *.jpg
 *.png
+DEFENSE_GUIDE.md
